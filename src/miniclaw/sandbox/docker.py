@@ -77,10 +77,9 @@ class DockerSandbox:
             )
         relative = cwd.relative_to(workspace)
         container_cwd = str(PurePosixPath("/workspace") / PurePosixPath(relative))
-        mount_mode = "readonly" if policy.filesystem == "read" else "rw"
-        mount = (
-            f"type=bind,src={workspace},dst=/workspace,{mount_mode}"
-        )
+        mount = f"type=bind,src={workspace},dst=/workspace"
+        if policy.filesystem == "read":
+            mount += ",readonly"
         argv = (
             "docker",
             "run",

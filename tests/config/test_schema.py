@@ -224,3 +224,32 @@ def test_file_secret_is_used_when_environment_is_empty() -> None:
     )
 
     assert provider.get("OPENAI_API_KEY") == "file-secret-1234"
+
+
+def test_search_secret_is_independent_and_environment_only() -> None:
+    document = ConfigDocument({"api_key": "file-model-secret"})
+    environment = {
+        "OPENAI_API_KEY": "environment-model-secret",
+        "MINICLAW_SEARCH_API_KEY": "environment-search-secret",
+        "GITHUB_TOKEN": "unrelated-secret",
+    }
+    provider = ConfigSecretProvider(document, environment)
+
+    assert provider.get("OPENAI_API_KEY") == "environment-model-secret"
+    assert provider.get("MINICLAW_SEARCH_API_KEY") == "environment-search-secret"
+    assert provider.get("GITHUB_TOKEN") is None
+    assert dict(document.values) == {"api_key": "file-model-secret"}
+    assert "MINICLAW_SEARCH_API_KEY" not in CONFIG_FIELDS
+
+
+@pytest.mark.parametrize("environment", [{}, {"MINICLAW_SEARCH_API_KEY": ""}])
+def test_missing_search_secret_never_falls_back_to_model_secret(
+    environment: dict[str, str],
+) -> None:
+    provider = ConfigSecretProvider(
+        ConfigDocument({"api_key": "file-model-secret"}),
+        environment,
+    )
+
+    assert provider.get("MINICLAW_SEARCH_API_KEY") is None
+    assert provider.get("OPENAI_API_KEY") == "file-model-secret"

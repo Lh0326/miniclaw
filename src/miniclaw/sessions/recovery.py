@@ -59,3 +59,58 @@ def pending_tool_executions(
             idempotent = False
         records.append(ToolExecutionRecord(tool_call_id, "started", idempotent))
     return tuple(records)
+
+
+def close_interrupted_tool_calls(
+    messages: tuple[Message, ...],
+    executions: tuple[ToolExecutionRecord, ...],
+) -> tuple[Message, ...]:
+    """Close unresolved calls without guessing their outcome or executing them.
+
+    Call this only after the recovery approval gate has passed. A model request
+    must contain a result for every call in an assistant batch before another
+    user or assistant message. Keep recorded results and insert error results
+    for interrupted calls after the batch's existing tool messages.
+    """
+    pending_ids = {
+        execution.tool_call_id
+        for execution in executions
+        if execution.status == "started"
+    }
+    if not pending_ids:
+        return messages
+
+    restored: list[Message] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        restored.append(message)
+        index += 1
+        interrupted = tuple(
+            item
+            for item in message.content
+            if isinstance(item, ToolCall) and item.id in pending_ids
+        )
+        if not interrupted:
+            continue
+        while index < len(messages) and messages[index].role == "tool":
+            restored.append(messages[index])
+            index += 1
+        for call in interrupted:
+            restored.append(
+                Message(
+                    "tool",
+                    (
+                        ToolResultContent(
+                            call.id,
+                            "Tool execution was interrupted before its result was "
+                            "recorded. The outcome is unknown: it may already have "
+                            "produced side effects. Recovery did not re-execute "
+                            "this call. Inspect the actual state before retrying.",
+                            is_error=True,
+                        ),
+                    ),
+                )
+            )
+            pending_ids.discard(call.id)
+    return tuple(restored)

@@ -52,6 +52,7 @@ from miniclaw.sessions.database import SessionRepository
 from miniclaw.sessions.events import JsonlEventStore
 from miniclaw.sessions.recovery import (
     RecoveryDecision,
+    close_interrupted_tool_calls,
     decide_recovery,
     pending_tool_executions,
 )
@@ -343,7 +344,7 @@ class MiniClawApp:
         if decision is RecoveryDecision.UNRECOVERABLE:
             reason = "no usable checkpoint for this session"
         elif decision is RecoveryDecision.REQUIRES_APPROVAL:
-            # Replaying a non-idempotent tool could duplicate a side effect,
+            # The result is unknown and a side effect may already have happened,
             # so a human decides whether this history may be resumed.
             approved = await self._approve_resume(run, pending)
             if not approved:
@@ -362,7 +363,9 @@ class MiniClawApp:
             )
         assert checkpoint is not None
         self.session_id = session_id
-        self.conversation = checkpoint.messages
+        self.conversation = close_interrupted_tool_calls(checkpoint.messages, pending)
+        if pending:
+            reason += f"; {len(pending)} interrupted tool call(s) have unknown outcomes"
         self.last_result = None
         return self._resume_result(
             session_id,
@@ -413,7 +416,7 @@ class MiniClawApp:
                     "decision": decision.value,
                     "resumed": resumed,
                     "restored_messages": (
-                        len(checkpoint.messages) if resumed and checkpoint else 0
+                        len(self.conversation) if resumed and checkpoint else 0
                     ),
                     "reason": reason,
                 },

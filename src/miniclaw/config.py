@@ -21,6 +21,8 @@ CONFIG_FIELDS = (
 )
 RUNTIME_FIELDS = tuple(field for field in CONFIG_FIELDS if field != "api_key")
 SECRET_FIELDS = frozenset({"api_key"})
+# These credentials remain environment-only, outside persisted configuration.
+_ENVIRONMENT_ONLY_SECRETS = frozenset({"MINICLAW_SEARCH_API_KEY"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,10 +190,15 @@ class ConfigSecretProvider:
             if environment_api_key
             else environment_api_key
         )
+        self._environment_only_secrets = {
+            name: value
+            for name in _ENVIRONMENT_ONLY_SECRETS
+            if (value := environ.get(name))
+        }
 
     def get(self, name: str) -> str | None:
         if name != "OPENAI_API_KEY":
-            return None
+            return self._environment_only_secrets.get(name)
         if self._environment_api_key:
             return self._environment_api_key
         return str(self._api_key) if self._api_key is not None else None

@@ -19,7 +19,7 @@ The repository makes the runtime mechanics visible, testable, and easy to inspec
 | --- | --- |
 | Agent execution | Explicit state transitions, streamed tool-call assembly, turn/tool budgets |
 | Tool governance | Declared capabilities mapped to `ALLOW`, `ASK`, or `DENY` |
-| File delivery | Run against a workspace copy, inspect changes, approve application |
+| Built-in file delivery | Edit a workspace copy, list changed files, review content, approve application |
 | Recovery | SHA-256 checkpoint checks and unmatched tool-call detection |
 | Streaming reliability | Bounded retries before the first event; no automatic stream restart afterward |
 | Audit performance | Cached event IDs and per-run sequences for incremental append validation |
@@ -49,6 +49,18 @@ The complete demo needs **no API key**. It uses a scripted model and temporary d
 - Save memory, create and cancel a scheduled job, and write a trace.
 - Confirm the source is unchanged before explicitly applying the generated artifact.
 
+Successful output includes these stable lines (dynamic run IDs omitted):
+
+```text
+high-risk command denied: yes
+memory saved: yes
+scheduled job status: cancelled
+source unchanged before apply: yes
+applied artifacts: notes.txt
+trace written: yes
+final response: offline MiniClaw flow completed
+```
+
 Other focused examples are in [examples/](examples/):
 `minimal_harness.py`, `streaming_repl.py`, `safe_file_agent.py`,
 `resumable_project_agent.py`, and `governed_multi_agent.py`.
@@ -66,6 +78,9 @@ uv run miniclaw config set api_key
 The last command prompts for the key, avoiding a key argument in shell history.
 `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_KEY` environment variables take precedence.
 See [.env.example](.env.example) for names; MiniClaw does not automatically load `.env` files.
+Complete the configuration commands first: a fresh installation still prompts for initial
+configuration even when the environment variables are present. `config show` displays
+the configuration file and defaults, not the final values after environment overrides.
 
 Start the installed CLI from the project you want the Agent to work on:
 
@@ -86,9 +101,12 @@ Terminal / local commands
           ├─ Context: budget trimming, Skills, memory, planning
           ├─ Model: httpx → SSE decoder → model events
           ├─ Tools: assembly → validation → permission → execution
-          │   ├─ Files / Shell / Git / Web / MCP
+          │   ├─ Built-in files → workspace copy
+          │   ├─ Shell / Git → selected Process or Docker backend → workspace copy
+          │   ├─ Web → HTTP on the host
+          │   ├─ MCP → external host process → server-configured files/services
           │   └─ Subagents / scheduled work
-          ├─ Workspace copy → review → approved apply
+          ├─ Workspace copy → list changed files → content review → approved apply
           └─ SQLite / checkpoints / event log / traces
 ```
 
@@ -100,7 +118,11 @@ The [Chinese README](README.md) also documents configuration, Skills, and MCP se
 Checkpoint loading verifies a stored SHA-256 digest. Conversation history is inspected for
 tool calls with no matching result. Unfinished non-idempotent or unknown tools require
 human approval before the session can resume.
-Resume restores message history; it does not automatically replay tools or restore an unapplied workspace copy.
+After recovery is allowed, missing tool results are filled with explicit error results
+stating that execution was interrupted and the outcome is unknown. Existing results are
+preserved so the next model request has paired calls/results. Resume restores message
+history; it does not execute those tools again, restore an unapplied workspace copy,
+or guarantee exactly-once side effects.
 
 Before the first emitted event, the HTTP client can retry rate limits (`429`), server errors
 (`5xx`), and timeouts using bounded exponential backoff with jitter.
@@ -121,13 +143,52 @@ Once any event has been emitted, errors propagate without restarting the stream.
 | Scheduling | `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task` |
 | MCP | Tools exposed by configured stdio servers |
 
-Use `/changes` to inspect the workspace copy and `/apply <path>` or `/apply --all`
-to request approval before writing artifacts back. `/sessions` lists sessions;
+`/changes` prints the sandbox path and changed file names; it does not show a line-by-line diff.
+Use an editor or compare a file in a separate terminal before approving it:
+
+```bash
+git diff --no-index -- /path/to/project/utils.py /path/to/sandbox/workspace/utils.py
+```
+
+Replace both paths with your project and the sandbox path shown by `/changes`.
+Exit code `1` means differences were found. Open newly created files directly for review.
+Then use `/apply <path>` or `/apply --all` to approve writing artifacts back. `/sessions` lists sessions;
 `/resume <id>` restores a saved conversation. `/help` lists the remaining commands.
+
+## Docker and MCP execution scope
+
+With Docker running and model configuration complete, prepare an image and explicitly
+select the command backend from the MiniClaw checkout:
+
+```bash
+docker pull python:3.12-slim
+uv run miniclaw --workspace /path/to/your/project --require-strong-sandbox --docker-image python:3.12-slim
+```
+
+Run `/sandbox` in the REPL and check that `selected` is `strong`. Docker installation alone
+does not enable this backend. The image must already exist because runtime uses `--pull never`;
+an unavailable backend fails startup rather than falling back to Process.
+
+Docker covers Shell/Git commands routed through the executor. Built-in file tools operate
+on the copy through the host Python process; model calls, Web requests, and MCP processes
+also remain on the host. The default image has no project dependencies or Git: prepare
+a suitable image and select it with `--docker-image`. Commands run without network access.
+
+The filesystem MCP example in the [Chinese README](README.md#mcp) passes `"."` relative
+to the **real project directory**. Approved writes can modify original files immediately,
+without `/apply` or the Docker command backend. MCP servers start during application
+initialization, before individual tool-call approval. Try the example in a dedicated demo
+project. MCP tool calls are treated as non-idempotent operations with side effects and
+require approval; see the [MCP architecture notes](docs/architecture.md#mcp-执行与审批).
 
 ## Verification
 
-The local publication check on **Linux with Python 3.12** produced:
+The repository has **500+ automated tests** and **10 core offline Evals**.
+See [CI](https://github.com/Lh0326/miniclaw/actions/workflows/ci.yml) for the current branch.
+The reproducible publication baseline, commit
+[e4152fd](https://github.com/Lh0326/miniclaw/commit/e4152fd3ef4cc2dac0d6752ce8b6791fee6a7cee),
+produced these local results on **Linux with Python 3.12**;
+its [CI run](https://github.com/Lh0326/miniclaw/actions/runs/36577936215) also checked Linux/macOS and packaging:
 
 | Check | Result |
 | --- | --- |
@@ -149,6 +210,8 @@ and Unicode output. Their event assertion checks presence, not strict ordering.
 Separate automated tests cover retry limits, authentication failures, timeouts,
 injected disconnections, checkpoint recovery, and event-log behavior.
 [CI](.github/workflows/ci.yml) runs offline checks on Linux/macOS and a clean wheel install on Linux.
+Linux CI prepares the Docker image and runs the real-container tests. Those integration
+tests skip when Docker or its image is unavailable, including on the macOS runner.
 
 ## Current boundaries
 

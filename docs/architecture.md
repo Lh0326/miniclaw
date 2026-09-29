@@ -15,11 +15,16 @@ flowchart LR
     Assembly --> Policy["ALLOW / ASK / DENY"]
     Policy --> Approval["交互或无人值守审批"]
     Approval --> Tools["工具注册表 / 参数校验 / 执行"]
-    Tools --> Workspace["工作区副本 / 进程或 Docker 后端"]
+    Tools --> Files["内置文件工具"]
+    Tools --> Commands["Shell / Git：Process 或 Docker 后端"]
+    Files --> Workspace["工作区副本"]
+    Commands --> Workspace
+    Tools --> Web["Web：宿主 HTTP"]
+    Tools --> MCP["MCP：外部宿主进程 / 服务器配置的目录"]
     Tools --> Loop
     Loop --> Persistence["SQLite / Checkpoint / JSONL"]
     Loop --> Trace["Trace / Metrics"]
-    Workspace --> Review["changes 检查 / apply 审批写回"]
+    Workspace --> Review["changes 列出路径 / 外部内容审阅 / apply 审批写回"]
 ```
 
 | 职责 | 主要源码 |
@@ -94,10 +99,10 @@ CLI 审批仅接受 `y`，单个审批请求 ID 不能重复消费；缺少审�
 
 [WorkspaceSession](../src/miniclaw/workspace/session.py) 将项目复制到独立工作目录，复制时排除符号链接。
 内置文件工具使用 [resolve_workspace_path](../src/miniclaw/workspace/paths.py) 拒绝绝对路径及解析后越出工作区的路径。
-模型运行阶段的文件修改首先发生在副本内。
+内置文件工具的修改发生在副本内。Shell/Git 以副本为工作目录，但 Process 后端不强制隔离宿主文件系统；外部 MCP 也不受这一副本约束。
 
 1. **执行**：文件工具和命令工具以副本为工作区。
-2. **检查**：`/changes` 比较副本与真实项目，展示文件差异。
+2. **检查**：`/changes` 比较副本与真实项目的文件摘要，只展示变更路径及副本位置，不输出逐行 diff。使用编辑器或 `git diff --no-index` 审阅具体文件内容后再应用。
 3. **应用**：`/apply <path>` 或 `/apply --all` 请求审批，再把选择的文件写回真实项目。
 
 写回前校验工作区清单和目标路径。每个文件在目标目录内创建临时文件，写入后 `flush`、`fsync`，再用 `replace` 替换目标。
@@ -128,6 +133,10 @@ CLI 审批仅接受 `y`，单个审批请求 ID 不能重复消费；缺少审�
 `/resume <session-id>` 对 `REQUIRES_APPROVAL` 请求单独的 `resume_session` 审批。
 拒绝或无法审批时不会恢复该历史；批准后恢复消息，并提示存在未完成操作。
 这个门禁避免在操作者不知情时继续有副作用疑点的会话。
+
+允许恢复后，恢复层为每个未配对调用添加 `is_error=True` 的工具结果，明确写出“执行中断、结果未知”，并保留已记录结果。
+补充结果放在对应助手工具批次之后、下一条非工具消息之前，保证下一次 HTTP 请求中调用与结果完整配对。
+这只是恢复历史的协议修复，不会执行工具，也不会把未知副作用伪装为失败或成功；原始 Checkpoint 保留不变。
 
 当前恢复语义是**恢复对话历史**：下一条输入创建新的运行，不自动精确重放原执行现场。
 它不能判定外部副作用是否已经发生，也不提供恰好一次执行保证。
@@ -185,6 +194,21 @@ Checkpoint 和主事件日志保留运行上下文，不能视为已全部脱敏
 启用强后端但 Docker 不可用时，应用启动失败，不静默降级。
 输出大小是在进程完成收集后检查，不能解释为流式内存上限。
 
+Docker 只用于经 `sandbox.execute` 调用的 Shell/Git 命令。内置文件工具仍由宿主 Python 操作副本，模型、Web 和 MCP 不进入这个后端。
+启用步骤见 [README 的 Docker 配置](../README.md#docker-命令执行后端)。需要预先准备镜像及项目依赖；默认 Python 镜像不提供 Git。
+
+### MCP 执行与审批
+
+[MCP 启动器](../src/miniclaw/app.py) 在真实 `config.workspace` 中通过 [StdioMcpClient](../src/miniclaw/mcp/client.py) 启动外部进程。
+该进程不进入工作区副本或 Docker 命令后端；配置参数中的 `.` 指向真实项目目录。
+服务器初始化发生在应用启动阶段，不经过逐次工具调用审批。因此，加载服务器本身就是允许运行该外部程序。
+
+[MCP bridge](../src/miniclaw/mcp/bridge.py) 将全部 MCP 工具声明为非幂等、有副作用和使用子进程的操作，默认调用需要审批。
+服务器提供的只读或幂等提示不能降低该审批要求；高风险提示只能提高风险。
+审批约束是否允许调用，不隔离服务器实际访问的文件或网络。filesystem MCP 写入获准后可能直接修改真实项目，无需 `/apply`。
+
+README 示例适合专门的演示目录。需要外部进程隔离时，应在服务器自己的启动方式与环境中配置，不能依赖 MiniClaw 的 `--require-strong-sandbox` 选项。
+
 ## 9. 离线验证与持续集成
 
 [FakeModel](../src/miniclaw/model/fake.py) 和 [ScriptedModel](../src/miniclaw/model/scripted.py) 让运行流程无需真实 API Key 即可复现。
@@ -201,4 +225,5 @@ Checkpoint 和主事件日志保留运行上下文，不能视为已全部脱敏
 | 故障注入与委派 / 后台权限 | [test_fault_injection.py](../tests/evals/test_fault_injection.py)、[test_subagent_factory.py](../tests/subagents/test_subagent_factory.py)、[test_scheduler_worker.py](../tests/scheduler/test_scheduler_worker.py) |
 
 [CI](../.github/workflows/ci.yml) 在 Linux 和 macOS 运行静态检查、测试及离线验收，并验证构建后的 wheel 可安装。
+Linux 任务预先拉取默认 Docker 镜像，验证命令执行、只读挂载和可写挂载；Docker 不可用的环境跳过这些集成测试。
 完整测试数量和通过状态应以对应提交的实际运行结果为准。

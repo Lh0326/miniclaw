@@ -4,15 +4,20 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from miniclaw.app import create_app
-from miniclaw.config import MiniClawConfig
+from miniclaw.config import ConfigDocument, ConfigSecretProvider, MiniClawConfig
+from miniclaw.core.messages import ResponseCompleted, TextDelta, ToolCallDelta
 from miniclaw.mcp.config import McpConfigError, load_mcp_servers
 from miniclaw.model.fake import FakeModel
+from miniclaw.model.scripted import ScriptedModel
+from miniclaw.permissions.approval import UnattendedApprovalProvider
 from miniclaw.scheduler.store import SchedulerStore
 from miniclaw.scheduler.types import ScheduledTask, ScheduledTaskStatus
 from miniclaw.web.config import SearchConfigError, load_search_endpoint
+from miniclaw.web.search import HttpSearchProvider, SearchEndpoint
 
 SERVER = Path(__file__).parent.parent / "fixtures" / "mcp" / "echo_server.py"
 
@@ -60,6 +65,95 @@ async def test_search_tool_appears_once_configured(tmp_path: Path) -> None:
     await app.aclose()
 
     assert "web_search" in names
+
+
+@pytest.mark.parametrize("search_key", ["search-environment-secret", None, ""])
+async def test_cli_secret_provider_reaches_search_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    search_key: str | None,
+) -> None:
+    # Isolate user configuration, and inject only the transport: app assembly,
+    # endpoint loading, credential selection and the HTTP request remain real.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    workspace = tmp_path / "project"
+    directory = workspace / ".miniclaw"
+    directory.mkdir(parents=True)
+    (directory / "search.json").write_text(
+        json.dumps(
+            {
+                "url": "https://search.invalid/v1",
+                "api_key_header": "X-Api-Key",
+            }
+        )
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Harness reference",
+                        "url": "https://example.invalid/harness",
+                        "description": "Offline search result",
+                    }
+                ]
+            },
+        )
+
+    def search_provider(
+        endpoint: SearchEndpoint,
+        *,
+        api_key: str | None,
+    ) -> HttpSearchProvider:
+        return HttpSearchProvider(
+            endpoint,
+            api_key=api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(
+        "miniclaw.tools.builtin.toolsets.HttpSearchProvider",
+        search_provider,
+    )
+    environment = {"OPENAI_API_KEY": "model-environment-secret"}
+    if search_key is not None:
+        environment["MINICLAW_SEARCH_API_KEY"] = search_key
+    secrets = ConfigSecretProvider(
+        ConfigDocument({"api_key": "model-file-secret"}),
+        environment,
+    )
+    model = ScriptedModel(
+        (
+            (
+                ToolCallDelta(0, "search-1", "web_search", '{"query":"harness"}'),
+                ResponseCompleted("tool_calls"),
+            ),
+            (TextDelta("search completed"), ResponseCompleted("stop")),
+        )
+    )
+    app = await create_app(
+        MiniClawConfig(tmp_path / "data", workspace),
+        provider=model,
+        secret_provider=secrets,
+        approval_provider=UnattendedApprovalProvider(("web_search",)),
+    )
+    try:
+        result = await app.run_prompt("find a harness reference")
+    finally:
+        await app.aclose()
+
+    assert result.output == "search completed"
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.url.params["q"] == "harness"
+    assert request.headers.get("X-Api-Key") == (search_key or None)
+    assert "authorization" not in request.headers
+    assert "model-environment-secret" not in str(request.headers)
+    assert "model-file-secret" not in str(request.headers)
 
 
 def test_search_config_refuses_an_inline_credential(tmp_path: Path) -> None:

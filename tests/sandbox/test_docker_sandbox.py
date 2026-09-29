@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from miniclaw.sandbox.docker import DockerSandbox
@@ -41,3 +43,48 @@ async def test_docker_executor_when_available(tmp_path) -> None:
     )
 
     assert result.stdout.strip() == "ok"
+
+
+@pytest.mark.parametrize(
+    ("filesystem", "expected_output", "expected_content"),
+    (
+        ("read", "read-only", "original\n"),
+        ("workspace-write", "updated", "updated\n"),
+    ),
+)
+async def test_docker_workspace_mount_enforces_write_policy(
+    tmp_path,
+    filesystem: str,
+    expected_output: str,
+    expected_content: str,
+) -> None:
+    docker = DockerSandbox()
+    capabilities = await docker.capabilities()
+    if not capabilities.available:
+        pytest.skip(f"strong sandbox unavailable: {capabilities.reason}")
+
+    target = tmp_path / "state.txt"
+    target.write_text("original\n")
+    script = """
+import errno
+from pathlib import Path
+
+try:
+    Path("state.txt").write_text("updated\\n")
+except OSError as error:
+    if error.errno != errno.EROFS:
+        raise
+    print("read-only")
+else:
+    print("updated")
+"""
+    result = await docker.execute(
+        Command(("python", "-c", script), tmp_path, {}),
+        SandboxPolicy(tmp_path, filesystem, "deny", (), 10.0, 4096),
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.strip() == expected_output
+    assert target.read_text() == expected_content
+    expected_changes = () if filesystem == "read" else (Path("state.txt"),)
+    assert result.changed_paths == expected_changes

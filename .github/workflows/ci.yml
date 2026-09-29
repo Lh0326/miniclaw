@@ -32,6 +32,10 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Prepare Docker integration image
+        if: runner.os == 'Linux'
+        run: docker pull python:3.12-slim
+
       - name: Test
         run: uv run pytest -q
 
