@@ -1,0 +1,36 @@
+.loopx/
+.codex/goals/
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+.env
+.DS_Store
+.worktrees/
+docs/teaching/
+
+# Personal documents and local artifacts
+*.pdf
+eval-report.json
+eval-report.md
+
+# Local configuration, sessions and verification output
+.miniclaw/
+.env.*
+!.env.example
+.verification/
+.ruff_cache/
+
+# Python build output
+dist/
+build/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+Thumbs.db
